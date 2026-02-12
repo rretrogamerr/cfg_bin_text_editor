@@ -190,7 +190,6 @@ impl CfgBinEncoding {
 pub struct CfgBin {
     pub encoding: CfgBinEncoding,
     pub entries: Vec<Entry>,
-    pub strings: HashMap<i32, String>,
 }
 
 fn read_i32(data: &[u8], pos: usize) -> i32 {
@@ -286,7 +285,6 @@ impl CfgBin {
         Ok(CfgBin {
             encoding,
             entries,
-            strings,
         })
     }
 

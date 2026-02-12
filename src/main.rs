@@ -14,7 +14,7 @@ use cfgbin::{CfgBin, TextEntry};
 #[command(about = "Extract and update text fields in Level-5 cfg.bin files")]
 struct Cli {
     /// Extract text fields to JSON
-    #[arg(short = 'e', value_name = "CFG_BIN_FILE", conflicts_with_all = ["write_file", "json_file"])]
+    #[arg(short = 'e', value_name = "CFG_BIN_FILE", conflicts_with_all = ["write_file", "json_file", "output_file"])]
     extract_file: Option<PathBuf>,
 
     /// Write updated text fields back to cfg.bin
@@ -24,6 +24,10 @@ struct Cli {
     /// JSON file with updated text fields (used with -w)
     #[arg(value_name = "JSON_FILE")]
     json_file: Option<PathBuf>,
+
+    /// Output file path (used with -w, defaults to overwriting the original)
+    #[arg(short = 'o', value_name = "OUTPUT_FILE")]
+    output_file: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -33,11 +37,13 @@ fn main() -> Result<()> {
         extract(&cfg_path)?;
     } else if let Some(cfg_path) = cli.write_file {
         let json_path = cli.json_file.unwrap();
-        update(&cfg_path, &json_path)?;
+        let out_path = cli.output_file.unwrap_or_else(|| cfg_path.clone());
+        update(&cfg_path, &json_path, &out_path)?;
     } else {
         eprintln!("Usage:");
         eprintln!("  Extract: cfg_bin_text_editor -e <file.cfg.bin>");
         eprintln!("  Update:  cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json>");
+        eprintln!("  Update:  cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json> -o <output.cfg.bin>");
         std::process::exit(1);
     }
 
@@ -58,7 +64,7 @@ fn extract(cfg_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn update(cfg_path: &PathBuf, json_path: &PathBuf) -> Result<()> {
+fn update(cfg_path: &PathBuf, json_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
     let data = fs::read(cfg_path).context("Failed to read cfg.bin file")?;
     let mut cfg = CfgBin::open(&data).context("Failed to parse cfg.bin file")?;
 
@@ -69,22 +75,7 @@ fn update(cfg_path: &PathBuf, json_path: &PathBuf) -> Result<()> {
     cfg.update_texts(&texts);
 
     let output = cfg.save();
-
-    // Write to *_updated.cfg.bin to preserve the original
-    let stem = cfg_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
-    // Handle double extensions like "a.cfg.bin" -> "a_updated.cfg.bin"
-    let out_name = if stem.ends_with(".cfg") {
-        let base = &stem[..stem.len() - 4];
-        format!("{}_updated.cfg.bin", base)
-    } else {
-        format!("{}_updated.cfg.bin", stem)
-    };
-    let out_path = cfg_path.with_file_name(&out_name);
-
-    fs::write(&out_path, &output).context("Failed to write updated cfg.bin file")?;
+    fs::write(out_path, &output).context("Failed to write cfg.bin file")?;
 
     println!("Written {} ({} text entries)", out_path.display(), texts.len());
     Ok(())
