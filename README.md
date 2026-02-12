@@ -18,8 +18,29 @@ Produces `<file.cfg.bin>.json`.
 cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json>
 ```
 
-The original file is preserved. Output is written to `<file>_updated.cfg.bin`.
-Example: `menu_text.cfg.bin` → `menu_text_updated.cfg.bin`
+By default, the original file is overwritten. Use `-o` to write to a different file:
+
+```sh
+cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json> -o <output.cfg.bin>
+```
+
+### Bulk operations (Windows)
+
+`cbte_bulk.bat` processes all `cfg.bin` files in a folder recursively (including subfolders).
+
+Extract all:
+
+```bat
+cbte_bulk.bat -e <folder>
+```
+
+Update all (each `*.cfg.bin.json` is matched to its `*.cfg.bin`):
+
+```bat
+cbte_bulk.bat -w <folder>
+```
+
+Requires `cfg_bin_text_editor.exe` in the same directory or in PATH. Progress is displayed during processing.
 
 ## JSON format
 
@@ -135,7 +156,7 @@ All integers are **little-endian**.
    - Header (placeholder) → Entries (string offsets recalculated) → String Table (distinct strings only) → Key Table → Footer
    - 16-byte alignment at each section boundary
    - Header is overwritten with correct values at the end
-4. Save as `*_updated.cfg.bin` (original is preserved)
+4. Save to the original file (or to `-o` path if specified)
 
 Extracting and immediately updating without modifying any text produces a byte-identical copy of the original (roundtrip guarantee).
 
