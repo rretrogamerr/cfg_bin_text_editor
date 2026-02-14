@@ -753,12 +753,12 @@ impl CfgBin {
     fn collect_texts_recursive(entry: &Entry, texts: &mut Vec<TextEntry>, global_index: &mut usize) {
         let entry_name = entry.get_name();
         for (var_idx, var) in entry.variables.iter().enumerate() {
-            if let VarValue::String(Some(s)) = &var.value {
+            if let VarValue::String(opt) = &var.value {
                 texts.push(TextEntry {
                     index: *global_index,
                     entry: entry_name.clone(),
                     variable_index: var_idx,
-                    value: s.clone(),
+                    value: opt.clone().unwrap_or_default(),
                 });
                 *global_index += 1;
             }
@@ -784,10 +784,13 @@ impl CfgBin {
         global_index: &mut usize,
     ) {
         for (_var_idx, var) in entry.variables.iter_mut().enumerate() {
-            if let VarValue::String(Some(_)) = &var.value {
-                // Find matching text entry by global_index
+            if let VarValue::String(_) = &var.value {
                 if let Some(te) = texts.iter().find(|t| t.index == *global_index) {
-                    var.value = VarValue::String(Some(te.value.clone()));
+                    if te.value.is_empty() {
+                        var.value = VarValue::String(None);
+                    } else {
+                        var.value = VarValue::String(Some(te.value.clone()));
+                    }
                 }
                 *global_index += 1;
             }
