@@ -178,17 +178,10 @@ pub enum CfgBinEncoding {
     ShiftJis,
 }
 
-impl CfgBinEncoding {
-    fn byte_value(&self) -> u8 {
-        match self {
-            CfgBinEncoding::ShiftJis => 0,
-            CfgBinEncoding::Utf8 => 1,
-        }
-    }
-}
-
 pub struct CfgBin {
     pub encoding: CfgBinEncoding,
+    // Raw footer encoding (u16 at file_end - 0x0A). Some files use values like 0x0100/0x0101 for UTF-8.
+    pub footer_encoding: u16,
     pub entries: Vec<Entry>,
 }
 
@@ -198,6 +191,10 @@ fn read_i32(data: &[u8], pos: usize) -> i32 {
 
 fn read_u32(data: &[u8], pos: usize) -> u32 {
     u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+}
+
+fn read_u16(data: &[u8], pos: usize) -> u16 {
+    u16::from_le_bytes([data[pos], data[pos + 1]])
 }
 
 fn read_f32(data: &[u8], pos: usize) -> f32 {
@@ -224,16 +221,22 @@ fn encode_string_bytes(s: &str, encoding: &CfgBinEncoding) -> Vec<u8> {
     }
 }
 
-fn read_null_terminated_string(data: &[u8], pos: &mut usize, encoding: &CfgBinEncoding) -> String {
-    let start = *pos;
-    while *pos < data.len() && data[*pos] != 0 {
-        *pos += 1;
+fn read_null_terminated_string_at(
+    data: &[u8],
+    offset: usize,
+    encoding: &CfgBinEncoding,
+) -> Option<String> {
+    if offset >= data.len() {
+        return None;
     }
-    let s = decode_string(&data[start..*pos], encoding);
-    if *pos < data.len() {
-        *pos += 1; // skip null
-    }
-    s
+
+    let rel_end = data[offset..].iter().position(|&b| b == 0);
+    let end = match rel_end {
+        Some(i) => offset + i,
+        None => data.len(),
+    };
+
+    Some(decode_string(&data[offset..end], encoding))
 }
 
 fn round_up(n: usize, exp: usize) -> usize {
@@ -250,13 +253,14 @@ fn write_alignment(buf: &mut Vec<u8>, alignment: usize, pad_byte: u8) {
 
 impl CfgBin {
     pub fn open(data: &[u8]) -> Result<Self> {
-        // Read encoding flag at offset -0x0A from end
-        let enc_byte = if data.len() >= 10 {
-            data[data.len() - 10]
+        // Footer encoding is a u16 at file_end - 0x0A.
+        // Some files use 0x0100/0x0101 for UTF-8 variants; treat any non-zero as UTF-8.
+        let footer_encoding = if data.len() >= 10 {
+            read_u16(data, data.len() - 10)
         } else {
             1 // default UTF-8
         };
-        let encoding = if enc_byte == 0 {
+        let encoding = if footer_encoding == 0 {
             CfgBinEncoding::ShiftJis
         } else {
             CfgBinEncoding::Utf8
@@ -266,11 +270,9 @@ impl CfgBin {
         let entries_count = read_i32(data, 0) as usize;
         let string_table_offset = read_i32(data, 4) as usize;
         let string_table_length = read_i32(data, 8) as usize;
-        let string_table_count = read_i32(data, 12) as usize;
 
-        // Parse string table
+        // Read string table blob
         let string_table_data = &data[string_table_offset..string_table_offset + string_table_length];
-        let strings = Self::parse_strings(string_table_count, string_table_data, &encoding);
 
         // Parse key table
         let key_table_offset = round_up(string_table_offset + string_table_length, 16);
@@ -280,29 +282,13 @@ impl CfgBin {
 
         // Parse entries
         let entries_data = &data[0x10..string_table_offset];
-        let entries = Self::parse_entries(entries_count, entries_data, &key_table, &strings, &encoding)?;
+        let entries = Self::parse_entries(entries_count, entries_data, &key_table, string_table_data, &encoding)?;
 
         Ok(CfgBin {
             encoding,
+            footer_encoding,
             entries,
         })
-    }
-
-    fn parse_strings(
-        count: usize,
-        data: &[u8],
-        encoding: &CfgBinEncoding,
-    ) -> HashMap<i32, String> {
-        let mut result = HashMap::new();
-        let mut pos = 0usize;
-        for _ in 0..count {
-            let offset = pos as i32;
-            if !result.contains_key(&offset) {
-                let s = read_null_terminated_string(data, &mut pos, encoding);
-                result.insert(offset, s);
-            }
-        }
-        result
     }
 
     fn parse_key_table(data: &[u8], encoding: &CfgBinEncoding) -> HashMap<u32, String> {
@@ -338,11 +324,12 @@ impl CfgBin {
         entries_count: usize,
         data: &[u8],
         key_table: &HashMap<u32, String>,
-        strings: &HashMap<i32, String>,
-        _encoding: &CfgBinEncoding,
+        string_table_data: &[u8],
+        encoding: &CfgBinEncoding,
     ) -> Result<Vec<Entry>> {
         let mut temp = Vec::new();
         let mut pos = 0usize;
+        let mut string_cache: HashMap<i32, Option<String>> = HashMap::new();
 
         for _ in 0..entries_count {
             let crc = read_u32(data, pos);
@@ -386,10 +373,14 @@ impl CfgBin {
                     VarType::String => {
                         let offset = read_i32(data, pos);
                         pos += 4;
-                        let text = if offset != -1 {
-                            strings.get(&offset).cloned()
-                        } else {
+                        let text = if offset < 0 {
                             None
+                        } else if let Some(v) = string_cache.get(&offset) {
+                            v.clone()
+                        } else {
+                            let v = read_null_terminated_string_at(string_table_data, offset as usize, encoding);
+                            string_cache.insert(offset, v.clone());
+                            v
                         };
                         variables.push(Variable {
                             var_type: VarType::String,
@@ -609,6 +600,7 @@ impl CfgBin {
     pub fn save(&self) -> Vec<u8> {
         let distinct_strings = self.get_distinct_strings();
         let strings_table = self.build_strings_table(&distinct_strings);
+        let strings_data = self.encode_strings(&distinct_strings);
 
         let mut buf = Vec::new();
 
@@ -624,10 +616,8 @@ impl CfgBin {
         write_alignment(&mut buf, 16, 0xFF);
         let string_table_offset = buf.len() as i32;
 
-        let mut string_table_length = 0i32;
+        let string_table_length = strings_data.len() as i32;
         if !distinct_strings.is_empty() {
-            let strings_data = self.encode_strings(&distinct_strings);
-            string_table_length = strings_data.len() as i32;
             buf.extend_from_slice(&strings_data);
             write_alignment(&mut buf, 16, 0xFF);
         }
@@ -650,10 +640,22 @@ impl CfgBin {
         buf.extend_from_slice(&key_table_data);
 
         // Footer
-        buf.extend_from_slice(&[0x01, 0x74, 0x32, 0x62, 0xFE]);
-        buf.extend_from_slice(&[0x01, self.encoding.byte_value(), 0x00, 0x01]);
-        // WriteAlignment(): write 0x00 then align to 16 with 0xFF
-        buf.push(0x00);
+        // Footer layout matches CfgBinEditor2:
+        // magic(u32=0x62327401) + unk1(i16=0x01FE) + encoding(u16) + unk2(i16=1)
+        buf.extend_from_slice(&[0x01, 0x74, 0x32, 0x62]);
+        buf.extend_from_slice(&(0x01FEu16).to_le_bytes());
+        let footer_encoding = match self.encoding {
+            CfgBinEncoding::ShiftJis => 0u16,
+            CfgBinEncoding::Utf8 => {
+                if self.footer_encoding == 0 {
+                    1u16
+                } else {
+                    self.footer_encoding
+                }
+            }
+        };
+        buf.extend_from_slice(&footer_encoding.to_le_bytes());
+        buf.extend_from_slice(&(1u16).to_le_bytes());
         write_alignment(&mut buf, 16, 0xFF);
 
         // Write header
@@ -807,4 +809,125 @@ pub struct TextEntry {
     pub entry: String,
     pub variable_index: usize,
     pub value: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_resolves_suffix_offsets_in_string_table() -> Result<()> {
+        let encoding = CfgBinEncoding::Utf8;
+        let entry_name = "TEST";
+        let entry_crc = crc32::compute(&encode_string_bytes(entry_name, &encoding));
+
+        // One entry with a single string value pointing to offset 2 inside "abcdef\0" -> "cdef".
+        let mut entry_bytes = Vec::new();
+        entry_bytes.extend_from_slice(&entry_crc.to_le_bytes());
+        entry_bytes.push(1); // param_count
+        entry_bytes.push(0); // types: 1x string
+        entry_bytes.extend_from_slice(&[0xFF, 0xFF]); // padding to 4-byte alignment
+        entry_bytes.extend_from_slice(&2i32.to_le_bytes()); // string offset
+
+        let mut buf = vec![0u8; 16]; // header placeholder
+        buf.extend_from_slice(&entry_bytes);
+        write_alignment(&mut buf, 16, 0xFF);
+
+        let string_table_offset = buf.len() as i32;
+        let strings_data = b"abcdef\0".to_vec();
+        let string_table_length = strings_data.len() as i32;
+        let string_table_count = 1i32;
+
+        buf.extend_from_slice(&strings_data);
+        write_alignment(&mut buf, 16, 0xFF);
+
+        // Key table: only needs the entry name for CRC resolution.
+        let tmp_cfg = CfgBin {
+            encoding,
+            footer_encoding: 1,
+            entries: Vec::new(),
+        };
+        let key_table_data = tmp_cfg.encode_key_table(&[entry_name.to_string()]);
+        buf.extend_from_slice(&key_table_data);
+
+        // Footer (UTF-8).
+        buf.extend_from_slice(&[0x01, 0x74, 0x32, 0x62]);
+        buf.extend_from_slice(&(0x01FEu16).to_le_bytes());
+        buf.extend_from_slice(&(1u16).to_le_bytes());
+        buf.extend_from_slice(&(1u16).to_le_bytes());
+        write_alignment(&mut buf, 16, 0xFF);
+
+        // Header
+        buf[0..4].copy_from_slice(&(1i32).to_le_bytes());
+        buf[4..8].copy_from_slice(&string_table_offset.to_le_bytes());
+        buf[8..12].copy_from_slice(&string_table_length.to_le_bytes());
+        buf[12..16].copy_from_slice(&string_table_count.to_le_bytes());
+
+        let cfg = CfgBin::open(&buf)?;
+        let texts = cfg.extract_texts();
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].value, "cdef");
+
+        Ok(())
+    }
+
+    #[test]
+    fn save_writes_distinct_strings_without_suffix_cache() {
+        let entry = Entry {
+            name: "TEST_0".to_string(),
+            variables: vec![
+                Variable {
+                    var_type: VarType::String,
+                    value: VarValue::String(Some("abcdef".to_string())),
+                },
+                Variable {
+                    var_type: VarType::String,
+                    value: VarValue::String(Some("cdef".to_string())),
+                },
+            ],
+            children: Vec::new(),
+            end_terminator: false,
+        };
+
+        let cfg = CfgBin {
+            encoding: CfgBinEncoding::Utf8,
+            footer_encoding: 1,
+            entries: vec![entry],
+        };
+
+        let out = cfg.save();
+
+        let entries_count = read_i32(&out, 0);
+        let string_table_offset = read_i32(&out, 4) as usize;
+        let string_table_length = read_i32(&out, 8) as usize;
+        let string_table_count = read_i32(&out, 12);
+
+        assert_eq!(entries_count, 1);
+        assert_eq!(string_table_count, 2);
+
+        let string_blob = &out[string_table_offset..string_table_offset + string_table_length];
+        assert_eq!(string_blob, b"abcdef\0cdef\0");
+
+        // Parse first entry's two string offsets.
+        let entries_blob = &out[0x10..string_table_offset];
+        let mut p = 0usize;
+        p += 4; // crc
+        let param_count = entries_blob[p] as usize;
+        p += 1;
+        assert_eq!(param_count, 2);
+
+        // Read type bytes (ceil(2/4)=1), then align to 4.
+        p += 1;
+        if (1 + 1) % 4 != 0 {
+            let rem = p % 4;
+            if rem != 0 {
+                p += 4 - rem;
+            }
+        }
+
+        let off0 = read_i32(entries_blob, p);
+        let off1 = read_i32(entries_blob, p + 4);
+        assert_eq!(off0, 0);
+        assert_eq!(off1, 7);
+    }
 }
