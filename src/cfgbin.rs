@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use encoding_rs::SHIFT_JIS;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::crc32;
 
@@ -71,9 +72,7 @@ impl Entry {
             let end_name = if current_name.starts_with("PTREE") {
                 "_PTREE".to_string()
             } else {
-                current_name
-                    .replace("BEGIN", "END")
-                    .replace("BEG", "END")
+                current_name.replace("BEGIN", "END").replace("BEG", "END")
             };
             if !keys.contains(&end_name) {
                 keys.push(end_name);
@@ -92,7 +91,7 @@ impl Entry {
                     VarType::String => 0,
                     VarType::Int => 1,
                     VarType::Float => 2,
-                    VarType::Unknown => 0,
+                    VarType::Unknown => 3,
                 };
                 type_desc |= tag << ((j % 4) * 2);
             }
@@ -105,7 +104,11 @@ impl Entry {
         bytes
     }
 
-    fn encode_entry(&self, strings_table: &HashMap<String, i32>, encoding: &CfgBinEncoding) -> Vec<u8> {
+    fn encode_entry(
+        &self,
+        strings_table: &HashMap<String, i32>,
+        encoding: &CfgBinEncoding,
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
         let entry_name = self.get_name();
         let crc = crc32::compute(&encode_string_bytes(&entry_name, encoding));
@@ -142,7 +145,9 @@ impl Entry {
             let end_name = if entry_name.starts_with("PTREE") {
                 "_PTREE".to_string()
             } else {
-                self.get_name().replace("BEGIN", "END").replace("BEG", "END")
+                self.get_name()
+                    .replace("BEGIN", "END")
+                    .replace("BEG", "END")
             };
             let end_crc = crc32::compute(&encode_string_bytes(&end_name, encoding));
             buf.extend_from_slice(&end_crc.to_le_bytes());
@@ -251,20 +256,148 @@ fn write_alignment(buf: &mut Vec<u8>, alignment: usize, pad_byte: u8) {
     }
 }
 
+fn parse_address_key(key: &str) -> Result<u32> {
+    if let Some(hex) = key.strip_prefix("0x").or_else(|| key.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16)
+            .map_err(|_| anyhow!("Invalid hex address key: {}", key));
+    }
+
+    key.parse::<u32>()
+        .map_err(|_| anyhow!("Invalid decimal address key: {}", key))
+}
+
+fn detect_encoding(data: &[u8]) -> (CfgBinEncoding, u16) {
+    // Footer encoding is a u16 at file_end - 0x0A.
+    // Some files use values like 0x0100/0x0101 for UTF-8 variants; treat any non-zero as UTF-8.
+    let footer_encoding = if data.len() >= 10 {
+        read_u16(data, data.len() - 10)
+    } else {
+        1 // default UTF-8
+    };
+    let encoding = if footer_encoding == 0 {
+        CfgBinEncoding::ShiftJis
+    } else {
+        CfgBinEncoding::Utf8
+    };
+
+    (encoding, footer_encoding)
+}
+
+fn collect_string_refs_with_addresses(
+    data: &[u8],
+    encoding: &CfgBinEncoding,
+) -> Result<(usize, usize, i32, Vec<(usize, String)>)> {
+    if data.len() < 16 {
+        bail!("cfg.bin is too small");
+    }
+
+    let entry_count = read_i32(data, 0);
+    let string_table_offset = read_i32(data, 4);
+    let string_table_length = read_i32(data, 8);
+
+    if entry_count < 0 || string_table_offset < 16 || string_table_length < 0 {
+        bail!("Invalid cfg.bin header values");
+    }
+
+    let entry_count = entry_count as usize;
+    let string_table_offset = string_table_offset as usize;
+    let string_table_length = string_table_length as usize;
+
+    let string_table_end = string_table_offset
+        .checked_add(string_table_length)
+        .context("String table size overflow")?;
+    if string_table_offset > data.len() || string_table_end > data.len() {
+        bail!("String table range is out of file bounds");
+    }
+    if string_table_offset < 0x10 {
+        bail!("String table offset is before entries start");
+    }
+
+    let string_table_data = &data[string_table_offset..string_table_end];
+    let entries_end = string_table_offset;
+    let mut pos = 0x10usize;
+    let mut refs = Vec::new();
+
+    for _ in 0..entry_count {
+        if pos.checked_add(5).context("Entry parse overflow")? > entries_end {
+            bail!("Unexpected end while reading entry header");
+        }
+
+        pos += 4; // crc
+        let param_count = data[pos] as usize;
+        pos += 1;
+
+        let type_byte_count = ((param_count as f64) / 4.0).ceil() as usize;
+        if pos
+            .checked_add(type_byte_count)
+            .context("Type descriptor overflow")?
+            > entries_end
+        {
+            bail!("Unexpected end while reading type descriptors");
+        }
+
+        let mut param_types = Vec::with_capacity(param_count);
+        for _ in 0..type_byte_count {
+            let param_type_byte = data[pos];
+            pos += 1;
+            for k in 0..4 {
+                if param_types.len() < param_count {
+                    let tag = (param_type_byte >> (2 * k)) & 3;
+                    param_types.push(match tag {
+                        0 => VarType::String,
+                        1 => VarType::Int,
+                        2 => VarType::Float,
+                        _ => VarType::Unknown,
+                    });
+                }
+            }
+        }
+
+        // Alignment: if (ceil(paramCount/4) + 1) % 4 != 0, align to 4
+        if (type_byte_count + 1) % 4 != 0 {
+            let rem = pos % 4;
+            if rem != 0 {
+                pos += 4 - rem;
+            }
+        }
+
+        if pos > entries_end {
+            bail!("Unexpected end while applying entry alignment");
+        }
+
+        for j in 0..param_count {
+            if pos.checked_add(4).context("Entry value overflow")? > entries_end {
+                bail!("Unexpected end while reading entry values");
+            }
+
+            if matches!(param_types[j], VarType::String) {
+                let string_offset = read_i32(data, pos);
+                if string_offset >= 0 {
+                    let value = read_null_terminated_string_at(
+                        string_table_data,
+                        string_offset as usize,
+                        encoding,
+                    )
+                    .unwrap_or_default();
+                    refs.push((pos, value));
+                }
+            }
+
+            pos += 4;
+        }
+    }
+
+    Ok((
+        string_table_offset,
+        string_table_length,
+        entry_count as i32,
+        refs,
+    ))
+}
+
 impl CfgBin {
     pub fn open(data: &[u8]) -> Result<Self> {
-        // Footer encoding is a u16 at file_end - 0x0A.
-        // Some files use 0x0100/0x0101 for UTF-8 variants; treat any non-zero as UTF-8.
-        let footer_encoding = if data.len() >= 10 {
-            read_u16(data, data.len() - 10)
-        } else {
-            1 // default UTF-8
-        };
-        let encoding = if footer_encoding == 0 {
-            CfgBinEncoding::ShiftJis
-        } else {
-            CfgBinEncoding::Utf8
-        };
+        let (encoding, footer_encoding) = detect_encoding(data);
 
         // Read header (16 bytes)
         let entries_count = read_i32(data, 0) as usize;
@@ -272,7 +405,8 @@ impl CfgBin {
         let string_table_length = read_i32(data, 8) as usize;
 
         // Read string table blob
-        let string_table_data = &data[string_table_offset..string_table_offset + string_table_length];
+        let string_table_data =
+            &data[string_table_offset..string_table_offset + string_table_length];
 
         // Parse key table
         let key_table_offset = round_up(string_table_offset + string_table_length, 16);
@@ -282,13 +416,120 @@ impl CfgBin {
 
         // Parse entries
         let entries_data = &data[0x10..string_table_offset];
-        let entries = Self::parse_entries(entries_count, entries_data, &key_table, string_table_data, &encoding)?;
+        let entries = Self::parse_entries(
+            entries_count,
+            entries_data,
+            &key_table,
+            string_table_data,
+            &encoding,
+        )?;
 
         Ok(CfgBin {
             encoding,
             footer_encoding,
             entries,
         })
+    }
+
+    pub fn extract_texts_by_address(data: &[u8]) -> Result<BTreeMap<u32, String>> {
+        let (encoding, _) = detect_encoding(data);
+        let (_, _, _, refs) = collect_string_refs_with_addresses(data, &encoding)?;
+
+        let mut out = BTreeMap::new();
+        for (addr, value) in refs {
+            let key = addr as u32;
+            if out.insert(key, value).is_some() {
+                bail!("Duplicate string address found: 0x{:08X}", key);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn extract_texts_by_address_for_json(data: &[u8]) -> Result<BTreeMap<String, String>> {
+        let map = Self::extract_texts_by_address(data)?;
+        Ok(map
+            .into_iter()
+            .map(|(addr, value)| (format!("0x{:08X}", addr), value))
+            .collect())
+    }
+
+    pub fn parse_address_texts_json(json_data: &str) -> Result<BTreeMap<u32, String>> {
+        let value: Value = serde_json::from_str(json_data).context("Failed to parse JSON file")?;
+        let obj = value
+            .as_object()
+            .context("Address mode JSON must be an object: {\"0xADDRESS\": \"text\"}")?;
+
+        let mut out = BTreeMap::new();
+        for (k, v) in obj {
+            let addr = parse_address_key(k)?;
+            let text = v
+                .as_str()
+                .context(format!("JSON value at key '{}' must be a string", k))?;
+            if out.insert(addr, text.to_string()).is_some() {
+                bail!("Duplicate address key in JSON: {}", k);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn patch_texts_by_address_in_place(
+        data: &[u8],
+        texts_by_address: &BTreeMap<u32, String>,
+    ) -> Result<Vec<u8>> {
+        let (encoding, _) = detect_encoding(data);
+        let (string_table_offset, old_string_table_length, entry_count, refs) =
+            collect_string_refs_with_addresses(data, &encoding)?;
+
+        if refs.len() != texts_by_address.len() {
+            bail!(
+                "Address count mismatch: source has {}, JSON has {}",
+                refs.len(),
+                texts_by_address.len()
+            );
+        }
+
+        let mut new_string_table = Vec::new();
+        let mut new_offsets_by_addr: HashMap<usize, i32> = HashMap::new();
+        let mut next_offset = 0i32;
+
+        for (addr, _original) in &refs {
+            let key = *addr as u32;
+            let new_text = texts_by_address
+                .get(&key)
+                .context(format!("Missing address in JSON: 0x{:08X}", key))?;
+            new_offsets_by_addr.insert(*addr, next_offset);
+
+            let encoded = encode_string_bytes(new_text, &encoding);
+            new_string_table.extend_from_slice(&encoded);
+            new_string_table.push(0x00);
+            next_offset += encoded.len() as i32 + 1;
+        }
+
+        let old_key_table_offset = round_up(string_table_offset + old_string_table_length, 16);
+        if old_key_table_offset > data.len() {
+            bail!("Invalid source key table offset");
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0u8; 16]); // header placeholder
+        out.extend_from_slice(&data[0x10..string_table_offset]); // entries unchanged
+        out.extend_from_slice(&new_string_table);
+        write_alignment(&mut out, 16, 0xFF);
+        out.extend_from_slice(&data[old_key_table_offset..]); // key table + footer unchanged
+
+        for (addr, new_offset) in new_offsets_by_addr {
+            if addr + 4 > out.len() {
+                bail!("Address out of range while patching: 0x{:08X}", addr);
+            }
+            out[addr..addr + 4].copy_from_slice(&new_offset.to_le_bytes());
+        }
+
+        out[0..4].copy_from_slice(&entry_count.to_le_bytes());
+        out[4..8].copy_from_slice(&(string_table_offset as i32).to_le_bytes());
+        out[8..12].copy_from_slice(&(new_string_table.len() as i32).to_le_bytes());
+        out[12..16].copy_from_slice(&(refs.len() as i32).to_le_bytes());
+
+        Ok(out)
     }
 
     fn parse_key_table(data: &[u8], encoding: &CfgBinEncoding) -> HashMap<u32, String> {
@@ -378,7 +619,11 @@ impl CfgBin {
                         } else if let Some(v) = string_cache.get(&offset) {
                             v.clone()
                         } else {
-                            let v = read_null_terminated_string_at(string_table_data, offset as usize, encoding);
+                            let v = read_null_terminated_string_at(
+                                string_table_data,
+                                offset as usize,
+                                encoding,
+                            );
                             string_cache.insert(offset, v.clone());
                             v
                         };
@@ -427,7 +672,12 @@ impl CfgBin {
         for entry in &mut temp {
             let count = occurrences.entry(entry.name.clone()).or_insert(0);
             entry.name = format!("{}_{}", entry.name, count);
-            *occurrences.get_mut(&entry.name.split('_').collect::<Vec<_>>()[..entry.name.split('_').count() - 1].join("_")).unwrap() += 1;
+            *occurrences
+                .get_mut(
+                    &entry.name.split('_').collect::<Vec<_>>()[..entry.name.split('_').count() - 1]
+                        .join("_"),
+                )
+                .unwrap() += 1;
         }
 
         Ok(Self::process_entries(temp))
@@ -445,7 +695,11 @@ impl CfgBin {
             depth.retain(|(k, _)| k != key);
         }
         fn depth_max_key(depth: &[(String, usize)]) -> String {
-            depth.iter().max_by_key(|(_, v)| v).map(|(k, _)| k.clone()).unwrap_or_default()
+            depth
+                .iter()
+                .max_by_key(|(_, v)| v)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default()
         }
 
         let mut i = 0;
@@ -519,13 +773,17 @@ impl CfgBin {
                             if let Some(finished) = stack.pop() {
                                 // Propagate end_terminator and children up
                                 if let Some(parent) = stack.last_mut() {
-                                    if let Some(child) = parent.children.iter_mut().find(|c| c.name == finished.name) {
+                                    if let Some(child) =
+                                        parent.children.iter_mut().find(|c| c.name == finished.name)
+                                    {
                                         child.children = finished.children;
                                         child.end_terminator = finished.end_terminator;
                                     }
                                 } else {
                                     // Update in output
-                                    if let Some(out_entry) = output.iter_mut().find(|c| c.name == finished.name) {
+                                    if let Some(out_entry) =
+                                        output.iter_mut().find(|c| c.name == finished.name)
+                                    {
                                         out_entry.children = finished.children;
                                         out_entry.end_terminator = finished.end_terminator;
                                     }
@@ -536,7 +794,8 @@ impl CfgBin {
                     }
                 } else {
                     if let Some(finished) = stack.pop() {
-                        if let Some(out_entry) = output.iter_mut().find(|c| c.name == finished.name) {
+                        if let Some(out_entry) = output.iter_mut().find(|c| c.name == finished.name)
+                        {
                             out_entry.children = finished.children;
                             out_entry.end_terminator = finished.end_terminator;
                         }
@@ -570,7 +829,9 @@ impl CfgBin {
                         if !is_begin_type && !name.contains("_PTREE") {
                             if let Some(finished) = stack.pop() {
                                 if let Some(parent) = stack.last_mut() {
-                                    if let Some(child) = parent.children.iter_mut().find(|c| c.name == finished.name) {
+                                    if let Some(child) =
+                                        parent.children.iter_mut().find(|c| c.name == finished.name)
+                                    {
                                         child.children = finished.children;
                                         child.end_terminator = finished.end_terminator;
                                     }
@@ -752,7 +1013,11 @@ impl CfgBin {
         texts
     }
 
-    fn collect_texts_recursive(entry: &Entry, texts: &mut Vec<TextEntry>, global_index: &mut usize) {
+    fn collect_texts_recursive(
+        entry: &Entry,
+        texts: &mut Vec<TextEntry>,
+        global_index: &mut usize,
+    ) {
         let entry_name = entry.get_name();
         for (var_idx, var) in entry.variables.iter().enumerate() {
             if let VarValue::String(opt) = &var.value {
@@ -788,11 +1053,7 @@ impl CfgBin {
         for (_var_idx, var) in entry.variables.iter_mut().enumerate() {
             if let VarValue::String(_) = &var.value {
                 if let Some(te) = texts.iter().find(|t| t.index == *global_index) {
-                    if te.value.is_empty() {
-                        var.value = VarValue::String(None);
-                    } else {
-                        var.value = VarValue::String(Some(te.value.clone()));
-                    }
+                    var.value = VarValue::String(Some(te.value.clone()));
                 }
                 *global_index += 1;
             }
@@ -814,6 +1075,56 @@ pub struct TextEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_two_string_entry_cfg() -> Vec<u8> {
+        let encoding = CfgBinEncoding::Utf8;
+        let entry_name = "TEST";
+        let entry_crc = crc32::compute(&encode_string_bytes(entry_name, &encoding));
+
+        // One entry with two string params.
+        // Offsets initially point to "aa\0bb\0" -> 0 and 3.
+        let mut entry_bytes = Vec::new();
+        entry_bytes.extend_from_slice(&entry_crc.to_le_bytes());
+        entry_bytes.push(2); // param_count
+        entry_bytes.push(0); // types: 2x string
+        entry_bytes.extend_from_slice(&[0xFF, 0xFF]); // padding to 4-byte alignment
+        entry_bytes.extend_from_slice(&0i32.to_le_bytes());
+        entry_bytes.extend_from_slice(&3i32.to_le_bytes());
+
+        let mut buf = vec![0u8; 16]; // header placeholder
+        buf.extend_from_slice(&entry_bytes);
+        write_alignment(&mut buf, 16, 0xFF);
+
+        let string_table_offset = buf.len() as i32;
+        let strings_data = b"aa\0bb\0".to_vec();
+        let string_table_length = strings_data.len() as i32;
+        let string_table_count = 2i32;
+        buf.extend_from_slice(&strings_data);
+        write_alignment(&mut buf, 16, 0xFF);
+
+        let tmp_cfg = CfgBin {
+            encoding,
+            footer_encoding: 1,
+            entries: Vec::new(),
+        };
+        let key_table_data = tmp_cfg.encode_key_table(&[entry_name.to_string()]);
+        buf.extend_from_slice(&key_table_data);
+
+        // Footer (UTF-8)
+        buf.extend_from_slice(&[0x01, 0x74, 0x32, 0x62]);
+        buf.extend_from_slice(&(0x01FEu16).to_le_bytes());
+        buf.extend_from_slice(&(1u16).to_le_bytes());
+        buf.extend_from_slice(&(1u16).to_le_bytes());
+        write_alignment(&mut buf, 16, 0xFF);
+
+        // Header
+        buf[0..4].copy_from_slice(&(1i32).to_le_bytes());
+        buf[4..8].copy_from_slice(&string_table_offset.to_le_bytes());
+        buf[8..12].copy_from_slice(&string_table_length.to_le_bytes());
+        buf[12..16].copy_from_slice(&string_table_count.to_le_bytes());
+
+        buf
+    }
 
     #[test]
     fn open_resolves_suffix_offsets_in_string_table() -> Result<()> {
@@ -929,5 +1240,73 @@ mod tests {
         let off1 = read_i32(entries_blob, p + 4);
         assert_eq!(off0, 0);
         assert_eq!(off1, 7);
+    }
+
+    #[test]
+    fn encode_types_preserves_unknown_tag() {
+        let bytes = Entry::encode_types(&[VarType::Unknown]);
+        assert_eq!(bytes[0] & 0x03, 0x03);
+    }
+
+    #[test]
+    fn update_texts_keeps_empty_string_as_string() {
+        let mut cfg = CfgBin {
+            encoding: CfgBinEncoding::Utf8,
+            footer_encoding: 1,
+            entries: vec![Entry {
+                name: "TEST_0".to_string(),
+                variables: vec![Variable {
+                    var_type: VarType::String,
+                    value: VarValue::String(Some("x".to_string())),
+                }],
+                children: Vec::new(),
+                end_terminator: false,
+            }],
+        };
+
+        let texts = vec![TextEntry {
+            index: 0,
+            entry: "TEST".to_string(),
+            variable_index: 0,
+            value: String::new(),
+        }];
+        cfg.update_texts(&texts);
+
+        match &cfg.entries[0].variables[0].value {
+            VarValue::String(Some(s)) => assert!(s.is_empty()),
+            other => panic!("Expected empty Some(\"\"), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn patch_texts_by_address_in_place_updates_offsets_and_preserves_tail() -> Result<()> {
+        let src = make_two_string_entry_cfg();
+        let src_string_table_offset = read_i32(&src, 4) as usize;
+        let src_string_table_length = read_i32(&src, 8) as usize;
+        let src_tail_offset = round_up(src_string_table_offset + src_string_table_length, 16);
+
+        let mut replacement = BTreeMap::new();
+        replacement.insert(24u32, "hello".to_string());
+        replacement.insert(28u32, "q".to_string());
+
+        let out = CfgBin::patch_texts_by_address_in_place(&src, &replacement)?;
+
+        let out_string_table_offset = read_i32(&out, 4) as usize;
+        let out_string_table_length = read_i32(&out, 8) as usize;
+        let out_tail_offset = round_up(out_string_table_offset + out_string_table_length, 16);
+
+        assert_eq!(read_i32(&out, 0), 1);
+        assert_eq!(read_i32(&out, 12), 2);
+        assert_eq!(out_string_table_offset, src_string_table_offset);
+        assert_eq!(out_string_table_length, 8); // "hello\0q\0"
+
+        // Offset fields in entry area were updated in-place.
+        assert_eq!(read_i32(&out, 24), 0);
+        assert_eq!(read_i32(&out, 28), 6);
+
+        // Key table + footer bytes are copied as-is.
+        assert_eq!(&out[out_tail_offset..], &src[src_tail_offset..]);
+
+        Ok(())
     }
 }
