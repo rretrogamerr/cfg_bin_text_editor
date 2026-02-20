@@ -49,37 +49,37 @@ if errorlevel 1 (
 goto :eof
 
 :write
-echo Counting json files...
+echo Counting txt files...
 set "TOTAL=0"
-for /r "%FOLDER%" %%f in (*.cfg.bin.json) do set /a TOTAL+=1
+for /r "%FOLDER%" %%f in (*.cfg.bin.txt) do set /a TOTAL+=1
 
 if %TOTAL%==0 (
-    echo No cfg.bin.json files found in "%FOLDER%".
+    echo No cfg.bin.txt files found in "%FOLDER%".
     exit /b 0
 )
 
-echo Found %TOTAL% json files.
+echo Found %TOTAL% txt files.
 echo.
 
 set "COUNT=0"
 set "FAIL=0"
-for /r "%FOLDER%" %%f in (*.cfg.bin.json) do call :do_write "%%f"
+for /r "%FOLDER%" %%f in (*.cfg.bin.txt) do call :do_write "%%f"
 goto :done
 
 :do_write
 set /a COUNT+=1
 set /a PERCENT=COUNT*100/TOTAL
-set "JSON=%~1"
-set "CFG=!JSON:.json=!"
+set "TXT=%~1"
+set "CFG=%~dpn1"
 if exist "!CFG!" (
     echo [!COUNT!/%TOTAL%] !PERCENT!%% Updating nnk: !CFG!
-    "%CBTE%" -w "!CFG!" "!JSON!" --mode nnk
+    "%CBTE%" -w "!CFG!" "!TXT!" --mode nnk --update-format txt
     if errorlevel 1 (
         echo   FAILED: !CFG!
         set /a FAIL+=1
     )
 ) else (
-    echo [!COUNT!/%TOTAL%] !PERCENT!%% Skipped: !JSON!
+    echo [!COUNT!/%TOTAL%] !PERCENT!%% Skipped: !TXT!
     set /a FAIL+=1
 )
 goto :eof
@@ -92,5 +92,5 @@ goto :eof
 :usage
 echo Usage:
 echo   cbte_bulk_nnk.bat -e ^<folder^>    Extract all cfg.bin to txt line-by-line (nnk mode)
-echo   cbte_bulk_nnk.bat -w ^<folder^>    Update all cfg.bin from json (nnk mode)
+echo   cbte_bulk_nnk.bat -w ^<folder^>    Update all cfg.bin from txt (nnk mode)
 exit /b 1

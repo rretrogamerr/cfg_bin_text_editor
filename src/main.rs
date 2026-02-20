@@ -4,7 +4,7 @@ mod crc32;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 
 use cfgbin::{CfgBin, TextEntry};
@@ -21,6 +21,12 @@ enum ExtractFormat {
     Txt,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum UpdateFormat {
+    Json,
+    Txt,
+}
+
 #[derive(Parser)]
 #[command(name = "cfg_bin_text_editor")]
 #[command(about = "Extract and update text fields in Level-5 cfg.bin files")]
@@ -33,8 +39,8 @@ struct Cli {
     #[arg(short = 'w', value_name = "CFG_BIN_FILE", requires = "json_file")]
     write_file: Option<PathBuf>,
 
-    /// JSON file with updated text fields (used with -w)
-    #[arg(value_name = "JSON_FILE")]
+    /// Input file for update (json or txt; use with -w)
+    #[arg(value_name = "INPUT_FILE")]
     json_file: Option<PathBuf>,
 
     /// Output file path (used with -w, defaults to overwriting the original)
@@ -48,6 +54,10 @@ struct Cli {
     /// Extract output format: json (default) or txt (line-by-line values)
     #[arg(long, value_enum, default_value_t = ExtractFormat::Json)]
     extract_format: ExtractFormat,
+
+    /// Update input format: json (default) or txt (line-by-line values)
+    #[arg(long, value_enum, default_value_t = UpdateFormat::Json)]
+    update_format: UpdateFormat,
 }
 
 fn main() -> Result<()> {
@@ -56,16 +66,22 @@ fn main() -> Result<()> {
     if let Some(cfg_path) = cli.extract_file {
         extract(&cfg_path, cli.mode, cli.extract_format)?;
     } else if let Some(cfg_path) = cli.write_file {
-        let json_path = cli.json_file.unwrap();
+        let input_path = cli.json_file.unwrap();
         let out_path = cli.output_file.unwrap_or_else(|| cfg_path.clone());
-        update(&cfg_path, &json_path, &out_path, cli.mode)?;
+        update(
+            &cfg_path,
+            &input_path,
+            &out_path,
+            cli.mode,
+            cli.update_format,
+        )?;
     } else {
         eprintln!("Usage:");
         eprintln!("  Extract: cfg_bin_text_editor -e <file.cfg.bin>");
-        eprintln!("  Update:  cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json>");
-        eprintln!("  Update:  cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json> -o <output.cfg.bin>");
+        eprintln!("  Update:  cfg_bin_text_editor -w <file.cfg.bin> <input.json|input.txt>");
+        eprintln!("  Update:  cfg_bin_text_editor -w <file.cfg.bin> <input.json|input.txt> -o <output.cfg.bin>");
         eprintln!("  Mode:    --mode standard|nnk");
-        eprintln!("  Format:  --extract-format json|txt");
+        eprintln!("  Format:  --extract-format json|txt --update-format json|txt");
         std::process::exit(1);
     }
 
@@ -73,7 +89,74 @@ fn main() -> Result<()> {
 }
 
 fn normalize_txt_line(s: &str) -> String {
-    s.replace('\r', "\\r").replace('\n', "\\n")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn decode_txt_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+
+    out
+}
+
+fn read_txt_lines(input_path: &PathBuf) -> Result<Vec<String>> {
+    let raw = fs::read(input_path).context("Failed to read TXT file")?;
+    let mut content = String::from_utf8(raw).context("TXT file must be UTF-8")?;
+    if content.starts_with('\u{FEFF}') {
+        content.remove(0);
+    }
+    if content.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    content = content.replace("\r\n", "\n").replace('\r', "\n");
+    let has_trailing_newline = content.ends_with('\n');
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    if has_trailing_newline && lines.last() == Some(&"") {
+        lines.pop();
+    }
+
+    Ok(lines.into_iter().map(decode_txt_line).collect())
+}
+
+fn validate_line_count(expected: usize, actual: usize, input_path: &PathBuf) -> Result<()> {
+    if expected != actual {
+        bail!(
+            "Line count mismatch in {}: expected {}, got {}. Keep one line per text entry and represent embedded newlines as \\n.",
+            input_path.display(),
+            expected,
+            actual
+        );
+    }
+    Ok(())
 }
 
 fn extract(cfg_path: &PathBuf, mode: Mode, extract_format: ExtractFormat) -> Result<()> {
@@ -119,11 +202,17 @@ fn extract(cfg_path: &PathBuf, mode: Mode, extract_format: ExtractFormat) -> Res
     Ok(())
 }
 
-fn update(cfg_path: &PathBuf, json_path: &PathBuf, out_path: &PathBuf, mode: Mode) -> Result<()> {
+fn update(
+    cfg_path: &PathBuf,
+    input_path: &PathBuf,
+    out_path: &PathBuf,
+    mode: Mode,
+    update_format: UpdateFormat,
+) -> Result<()> {
     let data = fs::read(cfg_path).context("Failed to read cfg.bin file")?;
-    let json_data = fs::read_to_string(json_path).context("Failed to read JSON file")?;
-    let output = match mode {
-        Mode::Standard => {
+    let output = match (mode, update_format) {
+        (Mode::Standard, UpdateFormat::Json) => {
+            let json_data = fs::read_to_string(input_path).context("Failed to read JSON file")?;
             let mut cfg = CfgBin::open(&data).context("Failed to parse cfg.bin file")?;
             let texts: Vec<TextEntry> =
                 serde_json::from_str(&json_data).context("Failed to parse JSON file")?;
@@ -131,22 +220,63 @@ fn update(cfg_path: &PathBuf, json_path: &PathBuf, out_path: &PathBuf, mode: Mod
             cfg.update_texts(&texts);
             let output = cfg.save();
             println!(
-                "Written {} ({} text entries, mode=standard)",
+                "Written {} ({} text entries, mode=standard, update=json)",
                 out_path.display(),
                 text_count
             );
             output
         }
-        Mode::Nnk => {
+        (Mode::Standard, UpdateFormat::Txt) => {
+            let mut cfg = CfgBin::open(&data).context("Failed to parse cfg.bin file")?;
+            let mut texts = cfg.extract_texts();
+            let expected = texts.len();
+            let lines = read_txt_lines(input_path)?;
+            validate_line_count(expected, lines.len(), input_path)?;
+
+            for (te, line) in texts.iter_mut().zip(lines.into_iter()) {
+                te.value = line;
+            }
+
+            cfg.update_texts(&texts);
+            let output = cfg.save();
+            println!(
+                "Written {} ({} text entries, mode=standard, update=txt)",
+                out_path.display(),
+                expected
+            );
+            output
+        }
+        (Mode::Nnk, UpdateFormat::Json) => {
+            let json_data = fs::read_to_string(input_path).context("Failed to read JSON file")?;
             let texts = CfgBin::parse_address_texts_json(&json_data)
                 .context("Failed to parse address-based JSON for nnk mode")?;
             let text_count = texts.len();
             let output = CfgBin::patch_texts_by_address_in_place(&data, &texts)
                 .context("Failed to patch cfg.bin in nnk mode")?;
             println!(
-                "Written {} ({} text entries, mode=nnk)",
+                "Written {} ({} text entries, mode=nnk, update=json)",
                 out_path.display(),
                 text_count
+            );
+            output
+        }
+        (Mode::Nnk, UpdateFormat::Txt) => {
+            let mut texts = CfgBin::extract_texts_by_address(&data)
+                .context("Failed to parse cfg.bin file in nnk mode")?;
+            let expected = texts.len();
+            let lines = read_txt_lines(input_path)?;
+            validate_line_count(expected, lines.len(), input_path)?;
+
+            for ((_, value), line) in texts.iter_mut().zip(lines.into_iter()) {
+                *value = line;
+            }
+
+            let output = CfgBin::patch_texts_by_address_in_place(&data, &texts)
+                .context("Failed to patch cfg.bin in nnk mode")?;
+            println!(
+                "Written {} ({} text entries, mode=nnk, update=txt)",
+                out_path.display(),
+                expected
             );
             output
         }
