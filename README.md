@@ -110,7 +110,10 @@ One text entry per line.
 
 - Use `\n` and `\r` escapes for embedded line breaks inside a single entry.
 - Backslashes are escaped as `\\`.
-- During update, line count must exactly match the number of text entries, otherwise update fails.
+- During update, line count must match the number of text entries, otherwise update fails.
+- Special case for some Japanese NNK files:
+  - If the first original text line is a timestamp in `YYYY/MM/DD HH:MM:SS` format, update also accepts `expected - 3` lines.
+  - In that case, the first three original metadata lines are preserved and TXT line 1 is applied to cfg.bin line 4.
 
 ## cfg.bin file format
 
@@ -200,7 +203,8 @@ All integers are **little-endian**.
    - TXT: values only, line-by-line in address order
 3. Update:
    - JSON: strict key/count match required
-   - TXT: strict line-count match required
+   - TXT: line-count match required, with one exception:
+     - if original line 1 is `YYYY/MM/DD HH:MM:SS`, `expected - 3` lines are also accepted and mapped from line 4
 4. Rebuild only string table region, patch string offsets in place, preserve entry/key/footer structure
 
 NNK mode is designed for compatibility with Ni no Kuni text workflows. Binary output may differ from source bytes while preserving text mapping.

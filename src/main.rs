@@ -147,16 +147,67 @@ fn read_txt_lines(input_path: &PathBuf) -> Result<Vec<String>> {
     Ok(lines.into_iter().map(decode_txt_line).collect())
 }
 
-fn validate_line_count(expected: usize, actual: usize, input_path: &PathBuf) -> Result<()> {
-    if expected != actual {
+fn is_datetime_timestamp_line(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 19 {
+        return false;
+    }
+    let is_digit = |c: u8| c.is_ascii_digit();
+    is_digit(b[0])
+        && is_digit(b[1])
+        && is_digit(b[2])
+        && is_digit(b[3])
+        && b[4] == b'/'
+        && is_digit(b[5])
+        && is_digit(b[6])
+        && b[7] == b'/'
+        && is_digit(b[8])
+        && is_digit(b[9])
+        && b[10] == b' '
+        && is_digit(b[11])
+        && is_digit(b[12])
+        && b[13] == b':'
+        && is_digit(b[14])
+        && is_digit(b[15])
+        && b[16] == b':'
+        && is_digit(b[17])
+        && is_digit(b[18])
+}
+
+fn resolve_txt_update_offset(
+    expected: usize,
+    actual: usize,
+    first_original_line: Option<&str>,
+    input_path: &PathBuf,
+) -> Result<usize> {
+    if expected == actual {
+        return Ok(0);
+    }
+
+    let can_skip_three_header_lines = expected >= 3
+        && expected - 3 == actual
+        && first_original_line.is_some_and(is_datetime_timestamp_line);
+
+    if can_skip_three_header_lines {
+        return Ok(3);
+    }
+
+    if first_original_line.is_some_and(is_datetime_timestamp_line) {
         bail!(
-            "Line count mismatch in {}: expected {}, got {}. Keep one line per text entry and represent embedded newlines as \\n.",
+            "Line count mismatch in {}: expected {} (or {} when skipping 3 metadata lines), got {}. Keep one line per text entry and represent embedded newlines as \\n.",
             input_path.display(),
             expected,
+            expected.saturating_sub(3),
             actual
         );
     }
-    Ok(())
+
+    bail!(
+        "Line count mismatch in {}: expected {}, got {}. Keep one line per text entry and represent embedded newlines as \\n.",
+        input_path.display(),
+        expected,
+        actual
+    );
 }
 
 fn extract(cfg_path: &PathBuf, mode: Mode, extract_format: ExtractFormat) -> Result<()> {
@@ -231,9 +282,11 @@ fn update(
             let mut texts = cfg.extract_texts();
             let expected = texts.len();
             let lines = read_txt_lines(input_path)?;
-            validate_line_count(expected, lines.len(), input_path)?;
+            let first_original_line = texts.first().map(|te| te.value.as_str());
+            let offset =
+                resolve_txt_update_offset(expected, lines.len(), first_original_line, input_path)?;
 
-            for (te, line) in texts.iter_mut().zip(lines.into_iter()) {
+            for (te, line) in texts.iter_mut().skip(offset).zip(lines.into_iter()) {
                 te.value = line;
             }
 
@@ -265,9 +318,11 @@ fn update(
                 .context("Failed to parse cfg.bin file in nnk mode")?;
             let expected = texts.len();
             let lines = read_txt_lines(input_path)?;
-            validate_line_count(expected, lines.len(), input_path)?;
+            let first_original_line = texts.values().next().map(String::as_str);
+            let offset =
+                resolve_txt_update_offset(expected, lines.len(), first_original_line, input_path)?;
 
-            for ((_, value), line) in texts.iter_mut().zip(lines.into_iter()) {
+            for ((_, value), line) in texts.iter_mut().skip(offset).zip(lines.into_iter()) {
                 *value = line;
             }
 
