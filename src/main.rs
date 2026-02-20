@@ -15,6 +15,12 @@ enum Mode {
     Nnk,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ExtractFormat {
+    Json,
+    Txt,
+}
+
 #[derive(Parser)]
 #[command(name = "cfg_bin_text_editor")]
 #[command(about = "Extract and update text fields in Level-5 cfg.bin files")]
@@ -38,13 +44,17 @@ struct Cli {
     /// Processing mode: standard(index-based rebuild) or nnk(address-based in-place patch)
     #[arg(long, value_enum, default_value_t = Mode::Standard)]
     mode: Mode,
+
+    /// Extract output format: json (default) or txt (line-by-line values)
+    #[arg(long, value_enum, default_value_t = ExtractFormat::Json)]
+    extract_format: ExtractFormat,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if let Some(cfg_path) = cli.extract_file {
-        extract(&cfg_path, cli.mode)?;
+        extract(&cfg_path, cli.mode, cli.extract_format)?;
     } else if let Some(cfg_path) = cli.write_file {
         let json_path = cli.json_file.unwrap();
         let out_path = cli.output_file.unwrap_or_else(|| cfg_path.clone());
@@ -55,31 +65,57 @@ fn main() -> Result<()> {
         eprintln!("  Update:  cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json>");
         eprintln!("  Update:  cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json> -o <output.cfg.bin>");
         eprintln!("  Mode:    --mode standard|nnk");
+        eprintln!("  Format:  --extract-format json|txt");
         std::process::exit(1);
     }
 
     Ok(())
 }
 
-fn extract(cfg_path: &PathBuf, mode: Mode) -> Result<()> {
+fn normalize_txt_line(s: &str) -> String {
+    s.replace('\r', "\\r").replace('\n', "\\n")
+}
+
+fn extract(cfg_path: &PathBuf, mode: Mode, extract_format: ExtractFormat) -> Result<()> {
     let data = fs::read(cfg_path).context("Failed to read cfg.bin file")?;
-    let json = match mode {
-        Mode::Standard => {
+    let (content, out_path, count) = match (mode, extract_format) {
+        (Mode::Standard, ExtractFormat::Json) => {
             let cfg = CfgBin::open(&data).context("Failed to parse cfg.bin file")?;
             let texts = cfg.extract_texts();
-            serde_json::to_string_pretty(&texts).context("Failed to serialize to JSON")?
+            let json =
+                serde_json::to_string_pretty(&texts).context("Failed to serialize to JSON")?;
+            (json, format!("{}.json", cfg_path.display()), texts.len())
         }
-        Mode::Nnk => {
+        (Mode::Standard, ExtractFormat::Txt) => {
+            let cfg = CfgBin::open(&data).context("Failed to parse cfg.bin file")?;
+            let texts = cfg.extract_texts();
+            let lines: Vec<String> = texts.iter().map(|t| normalize_txt_line(&t.value)).collect();
+            (
+                lines.join("\n"),
+                format!("{}.txt", cfg_path.display()),
+                texts.len(),
+            )
+        }
+        (Mode::Nnk, ExtractFormat::Json) => {
             let texts = CfgBin::extract_texts_by_address_for_json(&data)
                 .context("Failed to parse cfg.bin file in nnk mode")?;
-            serde_json::to_string_pretty(&texts).context("Failed to serialize to JSON")?
+            let json =
+                serde_json::to_string_pretty(&texts).context("Failed to serialize to JSON")?;
+            (json, format!("{}.json", cfg_path.display()), texts.len())
+        }
+        (Mode::Nnk, ExtractFormat::Txt) => {
+            let texts = CfgBin::extract_texts_by_address(&data)
+                .context("Failed to parse cfg.bin file in nnk mode")?;
+            let lines: Vec<String> = texts.values().map(|v| normalize_txt_line(v)).collect();
+            (
+                lines.join("\n"),
+                format!("{}.txt", cfg_path.display()),
+                texts.len(),
+            )
         }
     };
-
-    let json_path = format!("{}.json", cfg_path.display());
-    fs::write(&json_path, &json).context("Failed to write JSON file")?;
-
-    println!("Extracted text entries to {}", json_path);
+    fs::write(&out_path, &content).context("Failed to write extracted file")?;
+    println!("Extracted {} text entries to {}", count, out_path);
     Ok(())
 }
 

@@ -39,10 +39,11 @@ goto :done
 :do_extract
 set /a COUNT+=1
 set /a PERCENT=COUNT*100/TOTAL
-echo [!COUNT!/%TOTAL%] !PERCENT!%% Extracting (nnk): %~1
-"%CBTE%" -e "%~1" --mode nnk
+set "CFG_FILE=%~1"
+echo [!COUNT!/%TOTAL%] !PERCENT!%% Extracting nnk: !CFG_FILE!
+"%CBTE%" -e "!CFG_FILE!" --mode nnk --extract-format txt
 if errorlevel 1 (
-    echo   FAILED: %~1
+    echo   FAILED: !CFG_FILE!
     set /a FAIL+=1
 )
 goto :eof
@@ -71,14 +72,14 @@ set /a PERCENT=COUNT*100/TOTAL
 set "JSON=%~1"
 set "CFG=!JSON:.json=!"
 if exist "!CFG!" (
-    echo [!COUNT!/%TOTAL%] !PERCENT!%% Updating (nnk): !CFG!
-    "%CBTE%" -w "!CFG!" "%~1" --mode nnk
+    echo [!COUNT!/%TOTAL%] !PERCENT!%% Updating nnk: !CFG!
+    "%CBTE%" -w "!CFG!" "!JSON!" --mode nnk
     if errorlevel 1 (
         echo   FAILED: !CFG!
         set /a FAIL+=1
     )
 ) else (
-    echo [!COUNT!/%TOTAL%] !PERCENT!%% Skipped: %~1
+    echo [!COUNT!/%TOTAL%] !PERCENT!%% Skipped: !JSON!
     set /a FAIL+=1
 )
 goto :eof
@@ -90,6 +91,6 @@ goto :eof
 
 :usage
 echo Usage:
-echo   cbte_bulk_nnk.bat -e ^<folder^>    Extract all cfg.bin to json (nnk mode)
+echo   cbte_bulk_nnk.bat -e ^<folder^>    Extract all cfg.bin to txt line-by-line (nnk mode)
 echo   cbte_bulk_nnk.bat -w ^<folder^>    Update all cfg.bin from json (nnk mode)
 exit /b 1
