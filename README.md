@@ -1,50 +1,79 @@
 # cfg_bin_text_editor
 
-A Rust CLI tool that extracts text fields from Level-5 game engine `cfg.bin` files to JSON, and writes modified JSON back into `cfg.bin` files.
+A Rust CLI tool that extracts text fields from Level-5 game engine `cfg.bin` files to JSON/TXT, and writes modified data back into `cfg.bin` files.
+
+It supports two workflows:
+
+- `standard` mode: index-based full rebuild
+- `nnk` mode: address-based in-place string-table patching (Ni no Kuni workflow)
 
 ## Usage
 
-### Extract text
+### Extract
 
 ```sh
-cfg_bin_text_editor -e <file.cfg.bin>
+cfg_bin_text_editor -e <file.cfg.bin> [--mode standard|nnk] [--extract-format json|txt]
 ```
 
-Produces `<file.cfg.bin>.json`.
+Default is `--mode standard --extract-format json`.
 
-### Update text
+Examples:
 
 ```sh
-cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json>
+# Standard JSON
+cfg_bin_text_editor -e file.cfg.bin
+
+# NNK JSON (address-keyed)
+cfg_bin_text_editor -e file.cfg.bin --mode nnk
+
+# NNK TXT (line-by-line)
+cfg_bin_text_editor -e file.cfg.bin --mode nnk --extract-format txt
 ```
 
-By default, the original file is overwritten. Use `-o` to write to a different file:
+### Update
 
 ```sh
-cfg_bin_text_editor -w <file.cfg.bin> <file.cfg.bin.json> -o <output.cfg.bin>
+cfg_bin_text_editor -w <file.cfg.bin> <input.json|input.txt> [--mode standard|nnk] [--update-format json|txt] [-o <output.cfg.bin>]
+```
+
+Default is `--mode standard --update-format json`. Without `-o`, the original file is overwritten.
+
+Examples:
+
+```sh
+# Standard JSON update
+cfg_bin_text_editor -w file.cfg.bin file.cfg.bin.json
+
+# NNK JSON update
+cfg_bin_text_editor -w file.cfg.bin file.cfg.bin.json --mode nnk
+
+# NNK TXT update
+cfg_bin_text_editor -w file.cfg.bin file.cfg.bin.txt --mode nnk --update-format txt
 ```
 
 ### Bulk operations (Windows)
 
-`cbte_bulk.bat` processes all `cfg.bin` files in a folder recursively (including subfolders).
-
-Extract all:
+`cbte_bulk.bat` (standard mode, JSON input/output):
 
 ```bat
 cbte_bulk.bat -e <folder>
-```
-
-Update all (each `*.cfg.bin.json` is matched to its `*.cfg.bin`):
-
-```bat
 cbte_bulk.bat -w <folder>
 ```
 
-Requires `cfg_bin_text_editor.exe` in the same directory or in PATH. Progress is displayed during processing.
+`cbte_bulk_nnk.bat` (NNK mode, TXT input/output):
 
-## JSON format
+```bat
+cbte_bulk_nnk.bat -e <folder>
+cbte_bulk_nnk.bat -w <folder>
+```
 
-The extracted JSON is an array where each item represents a single text field:
+Both scripts process folders recursively. Requires `cfg_bin_text_editor.exe` in the same directory or in PATH.
+
+## Data formats
+
+### Standard JSON format (`--mode standard --extract-format json`)
+
+The extracted JSON is an array where each item represents one text field:
 
 ```json
 [
@@ -53,24 +82,35 @@ The extracted JSON is an array where each item represents a single text field:
     "entry": "TEXT_INFO",
     "variable_index": 2,
     "value": "カメラのスピード　上下"
-  },
-  {
-    "index": 1,
-    "entry": "TEXT_INFO",
-    "variable_index": 2,
-    "value": "カメラのスピード　左右"
   }
 ]
 ```
 
 | Field | Description |
 |-------|-------------|
-| `index` | Global sequence number. Used for matching during extract/update |
-| `entry` | Name of the Entry this text belongs to (resolved from CRC32 key table) |
-| `variable_index` | Index of this variable within the Entry |
-| `value` | The actual text content. Modify this field for translation |
+| `index` | Global sequence number |
+| `entry` | Entry name |
+| `variable_index` | Variable index inside the entry |
+| `value` | Text content |
 
-Only modify `value`. Do not change the other fields.
+### NNK JSON format (`--mode nnk --extract-format json`)
+
+The extracted JSON is an object keyed by absolute address of each string-offset field:
+
+```json
+{
+  "0x00000018": "text 1",
+  "0x0000001C": "text 2"
+}
+```
+
+### TXT format (`--extract-format txt` / `--update-format txt`)
+
+One text entry per line.
+
+- Use `\n` and `\r` escapes for embedded line breaks inside a single entry.
+- Backslashes are escaped as `\\`.
+- During update, line count must exactly match the number of text entries, otherwise update fails.
 
 ## cfg.bin file format
 
@@ -87,7 +127,7 @@ Only modify `value`. Do not change the other fields.
 | 0x00 | 4B | entries_count - Total number of entries |
 | 0x04 | 4B | string_table_offset - Byte offset where String Table begins |
 | 0x08 | 4B | string_table_length - Byte size of the String Table |
-| 0x0C | 4B | string_table_count - Number of distinct strings |
+| 0x0C | 4B | string_table_count - Number of strings (layout-dependent) |
 
 ### Entries (0x10 ~ string_table_offset)
 
@@ -124,10 +164,11 @@ Each section is aligned to 16 bytes (padded with `0xFF`).
 ### Footer
 
 ```
-01 74 32 62 FE  (magic bytes)
-01 XX 00 01     (XX: encoding flag, 0x00=SHIFT-JIS, 0x01=UTF-8)
-00              (separator)
-FF...           (padding to 16-byte alignment)
+u32 magic (0x62327401)
+u16 unk1  (0x01FE)
+u16 encoding (0=SHIFT-JIS, non-zero=UTF-8 variant)
+u16 unk2  (1)
+FF...     (padding to 16-byte alignment)
 ```
 
 ### CRC32
@@ -142,23 +183,38 @@ All integers are **little-endian**.
 
 ## How extract/update works
 
-### Extract (-e)
+### Standard mode (`--mode standard`)
 
 1. Parse the cfg.bin binary: read Header, Entries, String Table, and Key Table
-2. Walk all entries recursively, collecting variables of type `String`
-3. Assign a global index to each text field and output as a JSON array
-
-### Update (-w)
-
-1. Parse the original cfg.bin
-2. Read modified texts from JSON, match by `index`, and replace values in memory
-3. Rebuild the entire file:
+2. Collect all string variables in traversal order
+3. Extract to JSON array or TXT lines
+4. Update from JSON/TXT and rebuild:
    - Header (placeholder) → Entries (string offsets recalculated) → String Table (distinct strings only) → Key Table → Footer
-   - 16-byte alignment at each section boundary
-   - Header is overwritten with correct values at the end
-4. Save to the original file (or to `-o` path if specified)
+5. Save to output path (or overwrite original)
 
-Extracting and immediately updating without modifying any text produces a byte-identical copy of the original (roundtrip guarantee).
+### NNK mode (`--mode nnk`)
+
+1. Parse entries and collect string-offset field addresses in file order
+2. Extract:
+   - JSON: address-keyed object (`0xADDR -> text`)
+   - TXT: values only, line-by-line in address order
+3. Update:
+   - JSON: strict key/count match required
+   - TXT: strict line-count match required
+4. Rebuild only string table region, patch string offsets in place, preserve entry/key/footer structure
+
+NNK mode is designed for compatibility with Ni no Kuni text workflows. Binary output may differ from source bytes while preserving text mapping.
+
+## NNK mode version history (v0.4.0+)
+
+- `v0.4.0`
+  - Improved compatibility for string-table suffix offsets and footer encoding variants.
+- `v0.5.0`
+  - Added initial `nnk` mode (address-based workflow for Ni no Kuni).
+- `v0.6.0`
+  - Added TXT extraction support and NNK TXT bulk workflow.
+- `v0.7.0`
+  - Added stricter update validation in NNK mode.
 
 ## Build
 
